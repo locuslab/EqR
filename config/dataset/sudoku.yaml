@@ -1,0 +1,4 @@
+name: Sudoku-1k
+data_path: data/sudoku-extreme-1k-aug-1000
+
+evaluators: []

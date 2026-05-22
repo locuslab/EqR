@@ -1,0 +1,19 @@
+halt_max_steps: 16
+
+checkpoint: null
+param_iter:
+  arch.halt_max_steps: ${halt_max_steps}
+suffix: "D${halt_max_steps}_B${different_init}"
+
+global_batch_size: null
+max_eval_steps: null
+force_rerun: true
+
+different_init: 1
+different_init_reset_std: 1.0
+convergence_top_k: null
+convergence_window: 3
+report_conv_acc_stats: false
+enable_different_init_core_metrics: true
+
+wandb_run_name: "Eval_D${halt_max_steps}_B${different_init}"

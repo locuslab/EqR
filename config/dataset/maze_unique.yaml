@@ -1,0 +1,4 @@
+name: Maze-30x30-unique-1k
+data_path: data/maze-30x30-unique-1k
+
+evaluators: []

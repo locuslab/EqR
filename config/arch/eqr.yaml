@@ -1,0 +1,29 @@
+name: eqr@EqRModel
+short_name: EqR
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+H_cycles: 3
+L_cycles: 6
+
+H_layers: 0
+L_layers: 2
+
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+pos_encodings: rope
+board_height: 9
+board_width: 9
+forward_dtype: bfloat16
+mlp_t: false
+
+lambda_: 0.95
+noise_scale: 0.01
+H_init_std: 1.0
+L_init_std: 1.0
