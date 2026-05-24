@@ -111,6 +111,7 @@ dmypy.json
 
 # txt
 *.txt
+!requirements.txt
 
 *.pth
 *.pt
