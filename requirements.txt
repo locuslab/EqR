@@ -1,5 +1,5 @@
 # Core runtime
-torch>=2.0.0
+torch>=2.5.0
 numpy
 pydantic
 omegaconf

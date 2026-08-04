@@ -1,11 +1,13 @@
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from exceptiongroup import suppress
 from omegaconf import OmegaConf
+import wandb
+import yaml
 
 from utils.printing import rank_zero_print_info, rank_zero_print_warning
-import wandb
 
 if TYPE_CHECKING:
     from config.schema import PretrainConfig
@@ -17,6 +19,7 @@ _RUN_DIR: Optional[str] = None
 __all__ = [
     "set_run",
     "get_run_id",
+    "apply_wandb_secrets",
     "_WandbTableManager",
     "_config_to_wandb_dict",
 ]
@@ -35,6 +38,18 @@ def set_run(run_id: Optional[str], run_dir: Optional[str] = None) -> None:
 
 def get_run_id() -> Optional[str]:
     return _RUN_ID
+
+
+def apply_wandb_secrets(config: Any) -> None:
+    path = Path(os.environ.get("EQR_SECRETS_FILE", "config/secrets.yaml")).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    if not path.exists():
+        return
+    secrets = (yaml.safe_load(path.read_text()) or {}).get("wandb") or {}
+    for key, attr in (("project", "project_name"), ("entity", "entity")):
+        if secrets.get(key) and getattr(config, attr, None) is None:
+            setattr(config, attr, str(secrets[key]))
 
 
 class _WandbTableManager:

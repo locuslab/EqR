@@ -1,28 +1,30 @@
 import copy
+
 import torch.nn as nn
+
 from utils.printing import rank_zero_print_warning
 
-class EMAHelper(object):
+
+class EMAHelper:
     def __init__(self, mu=0.999):
         self.mu = mu
         self.shadow = {}
 
     def register(self, module):
-        self.shadow = {} # clean slate
+        previous = {name.replace("_orig_mod.", ""): value for name, value in self.shadow.items()}
+        self.shadow = {}
         if isinstance(module, nn.DataParallel):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+                value = previous.get(name.replace("_orig_mod.", ""))
+                self.shadow[name] = param.data.clone() if value is None else value
 
     def update(self, module):
         if isinstance(module, nn.DataParallel):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
-                # Be robust to parameters that are intentionally not tracked by EMA
-                # (e.g. batch-size dependent caches) or new params added after
-                # loading an EMA state_dict.
                 if name not in self.shadow:
                     rank_zero_print_warning(f"EMAHelper: registering new parameter '{name}' for EMA tracking.")
                     self.shadow[name] = param.data.clone()
@@ -34,8 +36,6 @@ class EMAHelper(object):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
-                # If a param is not tracked in the EMA shadow (e.g. was dropped
-                # from checkpoint for shape compatibility), leave it as-is.
                 v = self.shadow.get(name)
                 if v is None:
                     rank_zero_print_warning(f"EMAHelper: parameter '{name}' not found in EMA shadow; skipping EMA copy.")

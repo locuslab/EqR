@@ -201,12 +201,15 @@ bash scripts/train.sh trm_maze_unique
 NPROC_PER_NODE=2 bash scripts/train.sh eqr_maze_unique
 ```
 
-| Dataset | Config | Steps |
+| Dataset | Config | Training budget |
 | --- | --- | ---: |
 | Sudoku-Extreme | `config/train/eqr_sudoku.yaml` | 50k |
 | Sudoku-Extreme TRM baseline | `config/train/trm_sudoku.yaml` | 50k |
-| Maze-Unique | `config/train/eqr_maze_unique.yaml` | 100k |
+| Maze-Unique | `config/train/eqr_maze_unique.yaml` | 150k |
 | Maze-Unique TRM baseline | `config/train/trm_maze_unique.yaml` | 100k |
+
+The published Maze-Unique checkpoint is the best-evaluation checkpoint at step
+135k from the 150k training budget.
 
 ## Evaluation
 

@@ -23,8 +23,13 @@ target_q_update_every: 4
 beta1: 0.9
 beta2: 0.95
 weight_decay: 1.0
+puzzle_emb_lr: 1e-4
+puzzle_emb_weight_decay: 1.0
 arch:
   mlp_t: true
+  pos_encodings: none
+  puzzle_emb_ndim: 512
+  puzzle_emb_len: 16
 
 load_weights_only: false
 ema: true

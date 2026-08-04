@@ -43,3 +43,8 @@ class EvalConfig(pydantic.BaseModel):
     convergence_top_k: Optional[int] = None
     convergence_window: int = 3
     convergence_vis_plots: List[str] = Field(default_factory=list)
+    eval_act_streaming: bool = False
+    eval_act_streaming_slots: Optional[int] = None
+    eval_act_halt_threshold: float = 0.0
+    eval_act_halt_min_steps: Optional[int] = None
+    eval_act_streaming_selection_score: str = "convergence"

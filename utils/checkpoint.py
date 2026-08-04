@@ -465,6 +465,7 @@ def load_training_state(
                 if str(k).endswith("puzzle_emb.local_weights") or str(k).endswith("puzzle_emb.local_ids"):
                     shadow.pop(k, None)
             train_state.ema_helper.load_state_dict(tree_to_device(shadow, target_device))
+            train_state.ema_helper.register(train_state.model)
             rank_zero_print_info("Loaded EMA Shadow from checkpoint.")
         else:
             train_state.ema_helper.register(train_state.model)

@@ -54,10 +54,8 @@ from utils.metrics import (
     _should_log_grad_norms,
     _should_log_steps_hist, _collect_raw_steps_for_logging, _build_steps_hist_plotly,
 )
-from utils.wandb import set_run as wandb_set_run
-from utils.wandb import _config_to_wandb_dict
+from utils.wandb import _config_to_wandb_dict, apply_wandb_secrets, set_run as wandb_set_run
 from utils.optimizer import compute_lr
-from utils.secrets import apply_wandb_secrets_to_training_config
 from config.schema import PretrainConfig
 from contextlib import suppress
 
@@ -225,6 +223,12 @@ def create_model(
     optimizer_kwargs = dict(config.optimizer_kwargs)
     rank_zero_print_info(f"Using optimizer: adam_atan2 with args: {optimizer_kwargs}")
     from adam_atan2 import AdamATan2
+    if not hasattr(AdamATan2, "_cuda_graph_capture_health_check"):
+        setattr(
+            AdamATan2,
+            "_cuda_graph_capture_health_check",
+            AdamATan2._accelerator_graph_capture_health_check,
+        )
 
     betas = optimizer_kwargs.pop("betas", None)
     if betas is None:
@@ -242,8 +246,26 @@ def create_model(
             **optimizer_kwargs,
         ),
     ]
+    optimizer_lrs = [config.lr]
 
-    return model, optimizers, [config.lr]
+    inner = getattr(getattr(model, "model", model), "inner", None)
+    puzzle_emb = getattr(inner, "puzzle_emb", None)
+    if puzzle_emb is not None and getattr(getattr(inner, "config", None), "puzzle_emb_len", 0) > 0:
+        from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+
+        optimizers.append(
+            CastedSparseEmbeddingSignSGD_Distributed(
+                puzzle_emb.buffers(),
+                lr=0,
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size,
+            )
+        )
+        optimizer_lrs.append(config.puzzle_emb_lr)
+    else:
+        rank_zero_print_info("No puzzle embedding to optimize.")
+
+    return model, optimizers, optimizer_lrs
 
 
 
@@ -491,7 +513,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     objects = [None]
     if rank == 0:
         config = PretrainConfig(**hydra_config)  # type: ignore
-        apply_wandb_secrets_to_training_config(config)
+        apply_wandb_secrets(config)
 
         if config.run_name is None:
             model_id = config.arch.short_name if config.arch.short_name else config.arch.name.split('@')[-1]

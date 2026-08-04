@@ -55,6 +55,8 @@ class PretrainConfig(pydantic.BaseModel):
     beta2: float
 
     grad_clip_norm: Optional[float] = None
+    puzzle_emb_lr: float = 1e-4
+    puzzle_emb_weight_decay: float = 1.0
 
     target_q_update_every: int
 
@@ -102,6 +104,12 @@ class PretrainConfig(pydantic.BaseModel):
     convergence_window: int = 10
     convergence_top_k: Optional[int] = None
     convergence_vis_plots: List[str] = []
+
+    eval_act_streaming: bool = False
+    eval_act_streaming_slots: Optional[int] = None
+    eval_act_halt_threshold: float = 0.0
+    eval_act_halt_min_steps: Optional[int] = None
+    eval_act_streaming_selection_score: str = "convergence"
 
     @pydantic.model_validator(mode="after")
     def _validate_intervals(self) -> PretrainConfig:

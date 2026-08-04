@@ -1,3 +1,4 @@
+from dataclasses import fields, is_dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 import os
 import time
@@ -233,6 +234,84 @@ def _update_conv(state: Dict[str, torch.Tensor], preds: torch.Tensor, labels: to
             state[f"prefix_{i}"] += chosen[: i + 1].sum()
 
 
+def _stream_core_state(device: torch.device) -> Dict[str, torch.Tensor]:
+    return {
+        "samples": torch.zeros((), dtype=torch.float64, device=device),
+        "token_ok": torch.zeros((), dtype=torch.float64, device=device),
+        "token_total": torch.zeros((), dtype=torch.float64, device=device),
+        "exact": torch.zeros((), dtype=torch.float64, device=device),
+        "steps": torch.zeros((), dtype=torch.float64, device=device),
+        "forced_max_steps": torch.zeros((), dtype=torch.float64, device=device),
+        "q_halt_accuracy": torch.zeros((), dtype=torch.float64, device=device),
+        "q_halt_precision_num": torch.zeros((), dtype=torch.float64, device=device),
+        "q_halt_precision_den": torch.zeros((), dtype=torch.float64, device=device),
+        "q_halt_recall_num": torch.zeros((), dtype=torch.float64, device=device),
+        "q_halt_recall_den": torch.zeros((), dtype=torch.float64, device=device),
+    }
+
+
+def _update_stream_core(
+    state: Dict[str, torch.Tensor],
+    preds: torch.Tensor,
+    labels: torch.Tensor,
+    q_halt: torch.Tensor,
+    steps: torch.Tensor,
+    *,
+    halt_threshold: float,
+    halt_max_steps: int,
+) -> None:
+    mask = labels.ne(IGNORE_LABEL_ID)
+    token_total = mask.sum()
+    token_ok = (preds.eq(labels) & mask).sum()
+    loss_counts = mask.sum(dim=-1)
+    exact = ((preds.eq(labels) | ~mask).all(dim=-1) & loss_counts.gt(0))
+    q_positive = q_halt > float(halt_threshold)
+
+    state["samples"] += labels.shape[0]
+    state["token_ok"] += token_ok.to(state["token_ok"])
+    state["token_total"] += token_total.to(state["token_total"])
+    state["exact"] += exact.sum().to(state["exact"])
+    state["steps"] += steps.to(torch.float64).sum()
+    state["forced_max_steps"] += steps.ge(int(halt_max_steps)).sum().to(state["forced_max_steps"])
+    state["q_halt_accuracy"] += q_positive.eq(exact).sum().to(state["q_halt_accuracy"])
+    state["q_halt_precision_num"] += (q_positive & exact).sum().to(state["q_halt_precision_num"])
+    state["q_halt_precision_den"] += q_positive.sum().to(state["q_halt_precision_den"])
+    state["q_halt_recall_num"] += (q_positive & exact).sum().to(state["q_halt_recall_num"])
+    state["q_halt_recall_den"] += exact.sum().to(state["q_halt_recall_den"])
+
+
+def _finish_stream_core(
+    states: Dict[str, Dict[str, torch.Tensor]],
+    rank: int,
+    world_size: int,
+    group: Optional[dist.ProcessGroup],
+) -> Optional[Dict[str, Dict[str, float]]]:
+    names = list(next(iter(states.values())).keys()) if states else []
+    if not names:
+        return {} if rank == 0 else None
+    packed = torch.stack([torch.stack([state[name] for name in names]) for state in states.values()])
+    packed = _reduce_sum(packed, world_size, group)
+    if rank != 0:
+        return None
+    out: Dict[str, Dict[str, float]] = {}
+    for row_idx, set_name in enumerate(states):
+        vals = {name: float(packed[row_idx, col_idx].item()) for col_idx, name in enumerate(names)}
+        samples = vals["samples"]
+        token_total = vals["token_total"]
+        precision_den = vals["q_halt_precision_den"]
+        recall_den = vals["q_halt_recall_den"]
+        out[set_name] = {
+            "accuracy": vals["token_ok"] / token_total if token_total else 0.0,
+            "exact_accuracy": vals["exact"] / samples if samples else 0.0,
+            "steps": vals["steps"] / samples if samples else 0.0,
+            "forced_max_steps": vals["forced_max_steps"] / samples if samples else 0.0,
+            "q_halt_accuracy": vals["q_halt_accuracy"] / samples if samples else 0.0,
+            "q_halt_precision": vals["q_halt_precision_num"] / precision_den if precision_den else 0.0,
+            "q_halt_recall": vals["q_halt_recall_num"] / recall_den if recall_den else 0.0,
+        }
+    return out
+
+
 def _finish_conv(
     state: Optional[Dict[str, torch.Tensor]],
     top_k: int,
@@ -267,6 +346,220 @@ def _finish_conv(
     return metrics
 
 
+def _unwrap_eval_model(model: torch.nn.Module) -> torch.nn.Module:
+    model = getattr(model, "_orig_mod", model)
+    inner = getattr(model, "model", None)
+    if inner is None:
+        raise ValueError("ACT streaming eval requires a loss head with a .model attribute.")
+    return getattr(inner, "_orig_mod", inner)
+
+
+def _select_rows(obj: Any, idx: torch.Tensor) -> Any:
+    if torch.is_tensor(obj):
+        return obj.index_select(0, idx) if obj.ndim > 0 else obj
+    if is_dataclass(obj):
+        return type(obj)(**{field.name: _select_rows(getattr(obj, field.name), idx) for field in fields(obj)})
+    if isinstance(obj, dict):
+        return {key: _select_rows(value, idx) for key, value in obj.items()}
+    return obj
+
+
+def _evaluate_act_streaming(
+    config: PretrainConfig,
+    train_state: TrainState,
+    eval_loader: torch.utils.data.DataLoader,
+    eval_metadata: PuzzleDatasetMetadata,
+    rank: int,
+    world_size: int,
+    cpu_group: Optional[dist.ProcessGroup],
+    progress_bar: Optional[Any],
+    max_eval_steps: Optional[int],
+    different_init: Optional[int],
+) -> Tuple[Optional[Dict[str, Any]], float]:
+    if different_init is None or different_init <= 1:
+        raise ValueError("ACT streaming eval requires different_init > 1.")
+    if config.eval_save_outputs:
+        raise ValueError("ACT streaming eval does not support eval_save_outputs yet.")
+
+    start = time.time()
+    device = _device(train_state.model)
+    raw_model = _unwrap_eval_model(train_state.model)
+    n_init = int(different_init)
+    conv_k = min(int(getattr(config, "convergence_top_k", 0) or 0), n_init)
+    window = int(getattr(config, "convergence_window", 0) or 0)
+    halt_max_steps = int(getattr(raw_model.config, "halt_max_steps", getattr(config.arch, "halt_max_steps", 0)) or 0)
+    if halt_max_steps <= 0:
+        raise ValueError("ACT streaming eval requires a positive halt_max_steps.")
+    halt_threshold = float(getattr(config, "eval_act_halt_threshold", 0.0) or 0.0)
+    halt_min_steps = getattr(config, "eval_act_halt_min_steps", None)
+    halt_min_steps = max(1, int(halt_min_steps)) if halt_min_steps is not None else 1
+    slot_override = getattr(config, "eval_act_streaming_slots", None)
+    slot_override = int(slot_override) if slot_override is not None else None
+    if slot_override is not None and slot_override < 1:
+        raise ValueError("eval_act_streaming_slots must be positive when set.")
+    score_mode = str(
+        getattr(
+            config,
+            "eval_act_streaming_selection_score",
+            getattr(config, "eval_act_streaming_score", "convergence"),
+        )
+        or "convergence"
+    ).lower()
+    if score_mode not in {"q_halt", "convergence", "steps"}:
+        raise ValueError("eval_act_streaming_selection_score must be one of: q_halt, convergence, steps.")
+
+    core = {name: _stream_core_state(device) for name in eval_metadata.sets}
+    di = _di_state(device)
+    conv = _conv_state(device, conv_k) if conv_k > 0 else None
+
+    total = getattr(getattr(eval_loader, "dataset", None), "num_batches", lambda: None)()
+    if max_eval_steps is not None and total is not None:
+        total = min(total, max_eval_steps)
+    bar = tqdm.tqdm(
+        eval_loader,
+        total=total,
+        desc=f"ACT Stream ({world_size} ranks)",
+        disable=rank != 0,
+        leave=False,
+        dynamic_ncols=True,
+        position=1 if progress_bar is not None else 0,
+    )
+
+    with torch.inference_mode():
+        for step, (set_name, batch, _) in enumerate(bar, start=1):
+            if max_eval_steps is not None and step > max_eval_steps:
+                break
+            original_batch = tree_to_device(batch, device)
+            batch_size = int(original_batch["inputs"].shape[0])
+            if batch_size == 0:
+                continue
+
+            total_jobs = batch_size * n_init
+            slots = min(slot_override or batch_size, total_jobs)
+            sample_order = torch.arange(batch_size, device=device).repeat(n_init)
+            init_order = torch.arange(n_init, device=device).repeat_interleave(batch_size)
+            next_job = slots
+            active_sample = sample_order[:slots].clone()
+            active_init = init_order[:slots].clone()
+            active_batch = {key: value.index_select(0, active_sample) for key, value in original_batch.items()}
+            carry = raw_model.initial_carry(active_batch)  # type: ignore[attr-defined]
+
+            completed_preds = torch.empty((batch_size, n_init, *original_batch["labels"].shape[1:]), dtype=torch.long, device=device)
+            scores = torch.full((batch_size, n_init), float("inf"), dtype=torch.float32, device=device)
+            prev_logits: Optional[torch.Tensor] = None
+            has_prev = torch.zeros((slots,), dtype=torch.bool, device=device)
+            score_sum = torch.zeros((slots,), dtype=torch.float32, device=device)
+            score_count = torch.zeros((slots,), dtype=torch.int32, device=device)
+            score_window = torch.zeros((slots, max(window, 1)), dtype=torch.float32, device=device)
+            score_cursor = 0
+            completed = 0
+
+            while active_sample.numel() > 0:
+                carry, outputs = raw_model(carry=carry, batch=active_batch)
+                logits = outputs["logits"].detach()
+                q_halt = outputs["q_halt_logits"].detach()
+                steps = carry.steps.to(device=device)
+
+                if prev_logits is not None:
+                    delta = (logits - prev_logits).norm(dim=-1).mean(dim=-1).to(torch.float32)
+                    delta = torch.where(has_prev, delta, torch.zeros_like(delta))
+                    if window > 0:
+                        old = score_window[:, score_cursor % window]
+                        score_window[:, score_cursor % window] = delta
+                        score_sum += delta - torch.where(score_count.ge(window), old, torch.zeros_like(old))
+                        score_count = torch.where(has_prev, torch.minimum(score_count + 1, torch.full_like(score_count, window)), score_count)
+                        score_cursor += 1
+                    else:
+                        score_sum += delta
+                        score_count = torch.where(has_prev, score_count + 1, score_count)
+                prev_logits = logits
+                has_prev.fill_(True)
+
+                should_halt = (q_halt > halt_threshold) & steps.ge(halt_min_steps)
+                should_halt = should_halt | steps.ge(halt_max_steps)
+                if not bool(should_halt.any().item()):
+                    continue
+
+                halted_idx = should_halt.nonzero(as_tuple=False).flatten()
+                sample_idx = active_sample.index_select(0, halted_idx)
+                init_idx = active_init.index_select(0, halted_idx)
+                final_preds = logits.index_select(0, halted_idx).argmax(dim=-1)
+                final_labels = original_batch["labels"].index_select(0, sample_idx)
+                final_q = q_halt.index_select(0, halted_idx)
+                final_steps = steps.index_select(0, halted_idx)
+                denom = score_count.index_select(0, halted_idx).clamp_min(1).to(torch.float32)
+                if score_mode == "q_halt":
+                    final_scores = -final_q.to(torch.float32)
+                elif score_mode == "steps":
+                    final_scores = final_steps.to(torch.float32)
+                else:
+                    final_scores = score_sum.index_select(0, halted_idx) / denom
+
+                completed_preds[sample_idx, init_idx] = final_preds
+                scores[sample_idx, init_idx] = final_scores
+                _update_stream_core(
+                    core[set_name],
+                    final_preds,
+                    final_labels,
+                    final_q,
+                    final_steps,
+                    halt_threshold=halt_threshold,
+                    halt_max_steps=halt_max_steps,
+                )
+                completed += int(halted_idx.numel())
+
+                refilled = torch.zeros_like(should_halt)
+                for slot in halted_idx.tolist():
+                    if next_job >= total_jobs:
+                        continue
+                    sample = sample_order[next_job]
+                    init = init_order[next_job]
+                    next_job += 1
+                    active_sample[slot] = sample
+                    active_init[slot] = init
+                    for key, value in active_batch.items():
+                        value[slot] = original_batch[key][sample]
+                    carry.halted[slot] = True
+                    carry.steps[slot] = 0
+                    has_prev[slot] = False
+                    score_sum[slot] = 0
+                    score_count[slot] = 0
+                    score_window[slot].zero_()
+                    refilled[slot] = True
+
+                if completed >= total_jobs:
+                    break
+                keep = (~should_halt) | refilled
+                if not bool(keep.all().item()):
+                    keep_idx = keep.nonzero(as_tuple=False).flatten()
+                    active_sample = active_sample.index_select(0, keep_idx)
+                    active_init = active_init.index_select(0, keep_idx)
+                    active_batch = {key: value.index_select(0, keep_idx) for key, value in active_batch.items()}
+                    carry = _select_rows(carry, keep_idx)
+                    prev_logits = prev_logits.index_select(0, keep_idx) if prev_logits is not None else None
+                    has_prev = has_prev.index_select(0, keep_idx)
+                    score_sum = score_sum.index_select(0, keep_idx)
+                    score_count = score_count.index_select(0, keep_idx)
+                    score_window = score_window.index_select(0, keep_idx)
+
+            flat_preds = completed_preds.reshape(batch_size * n_init, *completed_preds.shape[2:])
+            _update_di(di, flat_preds, original_batch["labels"], n_init)
+            if conv is not None:
+                _update_conv(conv, flat_preds, original_batch["labels"], scores, conv_k)
+
+    bar.close()
+    reduced = _finish_stream_core(core, rank, world_size, cpu_group)
+    di_metrics = _finish_di(di, n_init, rank, world_size, cpu_group)
+    conv_metrics = _finish_conv(conv, conv_k, rank, world_size, cpu_group)
+    if rank == 0 and reduced is not None:
+        reduced.update(di_metrics)
+        reduced.update(conv_metrics)
+        if config.eval_dir is not None:
+            os.makedirs(config.eval_dir, exist_ok=True)
+            OmegaConf.save(config=OmegaConf.create(config.model_dump()), f=os.path.join(config.eval_dir, "eval_config.yaml"))
+    return reduced, time.time() - start
+
+
 def evaluate(
     config: PretrainConfig,
     train_state: TrainState,
@@ -284,6 +577,26 @@ def evaluate(
 ) -> Tuple[Optional[Dict[str, Any]], float]:
     start = time.time()
     device = _device(train_state.model)
+    if bool(getattr(config, "eval_act_streaming", False)):
+        if inference_runner is not None:
+            raise ValueError("ACT streaming eval does not support custom inference runners.")
+        if carry is not None:
+            raise ValueError("ACT streaming eval does not support a preloaded carry.")
+        if evaluators:
+            raise ValueError("ACT streaming eval does not support dataset evaluators yet.")
+        return _evaluate_act_streaming(
+            config=config,
+            train_state=train_state,
+            eval_loader=eval_loader,
+            eval_metadata=eval_metadata,
+            rank=rank,
+            world_size=world_size,
+            cpu_group=cpu_group,
+            progress_bar=progress_bar,
+            max_eval_steps=max_eval_steps,
+            different_init=different_init,
+        )
+
     set_ids = {name: i for i, name in enumerate(eval_metadata.sets)}
     state = _metric_state(device, len(set_ids))
     return_keys = set(config.eval_save_outputs)

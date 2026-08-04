@@ -1,0 +1,31 @@
+halt_max_steps: 64
+noise_scale: 0.5
+init_std: 1.0
+
+checkpoint: null
+param_iter:
+  arch.halt_max_steps: ${halt_max_steps}
+  arch.noise_scale: ${noise_scale}
+  arch.H_init_std: ${init_std}
+  arch.L_init_std: ${init_std}
+suffix: "sudoku_lite_act_stream_D${halt_max_steps}_B${different_init}_N${noise_scale}_S${init_std}"
+
+global_batch_size: 128
+max_eval_steps: 16
+force_rerun: true
+
+different_init: 128
+different_init_reset_std: ${init_std}
+convergence_top_k: 4
+convergence_window: 3
+
+eval_act_streaming: true
+eval_act_streaming_slots: null
+eval_act_halt_threshold: 0.0
+eval_act_halt_min_steps: 1
+eval_act_streaming_selection_score: convergence
+
+report_conv_acc_stats: false
+enable_different_init_core_metrics: true
+
+wandb_run_name: "Sudoku_Lite_ACT_Stream_D${halt_max_steps}_B${different_init}_N${noise_scale}_S${init_std}_K${convergence_top_k}"

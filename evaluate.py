@@ -276,6 +276,11 @@ def _run_checkpoint(eval_cfg: EvalConfig, ckpt_cfg: CheckpointEvalConfig, rank: 
         run_config.convergence_top_k = eval_cfg.convergence_top_k
         run_config.convergence_window = eval_cfg.convergence_window
         run_config.convergence_vis_plots = eval_cfg.convergence_vis_plots
+        run_config.eval_act_streaming = eval_cfg.eval_act_streaming
+        run_config.eval_act_streaming_slots = eval_cfg.eval_act_streaming_slots
+        run_config.eval_act_halt_threshold = eval_cfg.eval_act_halt_threshold
+        run_config.eval_act_halt_min_steps = eval_cfg.eval_act_halt_min_steps
+        run_config.eval_act_streaming_selection_score = eval_cfg.eval_act_streaming_selection_score
 
         metrics, elapsed = evaluate(
             run_config,
