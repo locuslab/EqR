@@ -25,7 +25,7 @@
 
 Code for reproducing EqR experiments on Sudoku-Extreme and Maze-Unique.
 
-**Maze-Unique update:** [It turns out Maze-Unique can be learned with much smaller models](supplements/maze_unique/README.md). Hparam tuning is important.
+- **Maze-Unique update:** [It turns out Maze-Unique can be learned with much smaller models](supplements/maze_unique/README.md). 
 
 <p align="center">
   <img src="assets/RI.gif" alt="EqR recurrent inference" width="49%">
