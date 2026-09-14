@@ -25,6 +25,8 @@
 
 Code for reproducing EqR experiments on Sudoku-Extreme and Maze-Unique.
 
+**Maze-Unique update:** [It turns out Maze-Unique can be learned with much smaller models](supplements/maze_unique/README.md). Hparam tuning is important.
+
 <p align="center">
   <img src="assets/RI.gif" alt="EqR recurrent inference" width="49%">
   <img src="assets/NI.gif" alt="EqR recurrent inference" width="49%">
@@ -197,6 +199,7 @@ bash scripts/train.sh eqr_sudoku
 bash scripts/train.sh trm_sudoku
 bash scripts/train.sh eqr_maze_unique
 bash scripts/train.sh trm_maze_unique
+bash scripts/train.sh hrm_maze_unique
 
 NPROC_PER_NODE=2 bash scripts/train.sh eqr_maze_unique
 ```
@@ -206,10 +209,23 @@ NPROC_PER_NODE=2 bash scripts/train.sh eqr_maze_unique
 | Sudoku-Extreme | `config/train/eqr_sudoku.yaml` | 50k |
 | Sudoku-Extreme TRM baseline | `config/train/trm_sudoku.yaml` | 50k |
 | Maze-Unique | `config/train/eqr_maze_unique.yaml` | 150k |
-| Maze-Unique TRM baseline | `config/train/trm_maze_unique.yaml` | 100k |
+| Maze-Unique TRM baseline | `config/train/trm_maze_unique.yaml` | 150k |
+| Maze-Unique HRM baseline | `config/train/hrm_maze_unique.yaml` | 150k |
 
-The published Maze-Unique checkpoint is the best-evaluation checkpoint at step
-135k from the 150k training budget.
+## Maze-Unique: Tuning and Small Models
+
+Our Maze-Unique experiments in the EqR paper used a limited hyperparameter
+search because of compute constraints. Broader tuning lets EqR reach
+**100% validation exact accuracy with substantially smaller models** on the
+released 30x30 task, motivating a search for the minimum model size.
+
+The width sweep points to a capacity boundary around **d=42 (39.9K core
+parameters)**: EqR reaches **98.6% peak exact accuracy**, while the equally
+sized TRM reaches **89.4%** after 24 LR/weight-decay trials within 150K updates.
+A separate HRM control at a nearby parameter budget (d=24, 41.8K core
+parameters) records **0% peak exact accuracy** across nine LR/WD trials
+with a 150K training budget. Full curves, search ranges, and reproduction scripts
+are in the [Maze-Unique supplement](supplements/maze_unique/README.md).
 
 ## Evaluation
 

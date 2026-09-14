@@ -8,6 +8,7 @@ from torch import nn
 
 from models.common import trunc_normal_init_
 from models.layers import Attention, CastedEmbedding, CastedLinear, CosSin, RotaryEmbedding, RotaryEmbedding2D, SwiGLU, rms_norm
+from models.sparse_embedding import CastedSparseEmbedding
 
 
 @dataclass
@@ -32,6 +33,8 @@ class ModelCarry:
 class TRMConfig(BaseModel):
     batch_size: int
     seq_len: int
+    input_seq_len: Optional[int] = None
+    num_puzzle_identifiers: int = 1
     vocab_size: int
     H_cycles: int
     L_cycles: int
@@ -54,6 +57,8 @@ class TRMConfig(BaseModel):
     halt_confirm_mode: str = "consecutive"
     forward_dtype: str = "bfloat16"
     mlp_t: bool = False
+    puzzle_emb_len: int = 0
+    puzzle_emb_ndim: int = 0
     no_ACT_continue: bool = True
 
 
@@ -110,15 +115,20 @@ class InnerNetwork(nn.Module):
         self.embed_scale = math.sqrt(config.hidden_size)
         embed_std = 1.0 / self.embed_scale
         self.embed_tokens = CastedEmbedding(config.vocab_size, config.hidden_size, embed_std, self.forward_dtype)
+        if config.puzzle_emb_len > 0:
+            self.puzzle_emb = CastedSparseEmbedding(config.num_puzzle_identifiers, config.puzzle_emb_ndim, config.batch_size, 0, self.forward_dtype)
         self.lm_head = CastedLinear(config.hidden_size, config.vocab_size, bias=False)
         self.q_head = CastedLinear(config.hidden_size, 2, bias=True)
         self._init_pos(embed_std)
-        self.L_level = Blocks([Block(config) for _ in range(config.L_layers)])
+        self._init_levels(config)
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
+
+    def _init_levels(self, config: TRMConfig) -> None:
+        self.L_level = Blocks([Block(config) for _ in range(config.L_layers)])
 
     def _board_dims(self) -> Tuple[int, int]:
         if self.config.board_height is not None and self.config.board_width is not None:
@@ -150,12 +160,19 @@ class InnerNetwork(nn.Module):
             return 0.707106781 * (x + self.absolute_pos_embedding.to(device=x.device, dtype=self.forward_dtype))
         return x
 
-    def _input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_scale * self._pos(self.embed_tokens(input_ids.to(torch.int32)))
+    def _prepend_puzzle(self, x: torch.Tensor, puzzle_ids: torch.Tensor) -> torch.Tensor:
+        if self.config.puzzle_emb_len == 0:
+            return x
+        puzzle = self.puzzle_emb(puzzle_ids.to(torch.int32))
+        puzzle = torch.nn.functional.pad(puzzle, (0, self.config.puzzle_emb_len * self.config.hidden_size - puzzle.shape[-1]))
+        return torch.cat((puzzle.view(-1, self.config.puzzle_emb_len, self.config.hidden_size), x), dim=1)
 
-    def _distribution_embeddings(self, probs: torch.Tensor) -> torch.Tensor:
+    def _input_embeddings(self, input_ids: torch.Tensor, puzzle_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_scale * self._pos(self._prepend_puzzle(self.embed_tokens(input_ids.to(torch.int32)), puzzle_ids))
+
+    def _distribution_embeddings(self, probs: torch.Tensor, puzzle_ids: torch.Tensor) -> torch.Tensor:
         x = (probs.to(torch.float32) @ self.embed_tokens.embedding_weight.to(torch.float32)).to(self.forward_dtype)
-        return self.embed_scale * self._pos(x)
+        return self.embed_scale * self._pos(self._prepend_puzzle(x, puzzle_ids))
 
     def empty_carry(self, batch_size: int) -> LatentCarry:
         shape = (batch_size, self.config.seq_len, self.config.hidden_size)
@@ -183,17 +200,17 @@ class InnerNetwork(nn.Module):
         z_H, z_L = self.deep_recursion(
             carry.z_H,
             carry.z_L,
-            self._input_embeddings(batch["inputs"]),
+            self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"]),
             {"cos_sin": self._cos_sin()},
         )
-        logits = self.lm_head(z_H)
+        logits = self.lm_head(z_H[:, self.config.puzzle_emb_len :])
         q = self.q_head(z_H[:, 0]).to(torch.float32)
         return LatentCarry(z_H.detach(), z_L.detach()), logits, (q[..., 0], q[..., 1])
 
     def forward_no_carry(self, z_H: torch.Tensor, z_L: torch.Tensor, batch: Dict[str, torch.Tensor]) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        z_H, z_L = self.deep_recursion(z_H, z_L, self._input_embeddings(batch["inputs"]), {"cos_sin": self._cos_sin()})
+        z_H, z_L = self.deep_recursion(z_H, z_L, self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"]), {"cos_sin": self._cos_sin()})
         q = self.q_head(z_H[:, 0]).to(torch.float32)
-        return (z_H, z_L), self.lm_head(z_H), (q[..., 0], q[..., 1])
+        return (z_H, z_L), self.lm_head(z_H[:, self.config.puzzle_emb_len :]), (q[..., 0], q[..., 1])
 
     def concat_states(self, z_H: torch.Tensor, z_L: torch.Tensor) -> torch.Tensor:
         return torch.cat((z_H, z_L), dim=1)
@@ -203,27 +220,36 @@ class InnerNetwork(nn.Module):
         return state[:, :n, :], state[:, n:, :]
 
     def _logits_embeddings(self, logits: torch.Tensor, puzzle_ids: torch.Tensor, *, temperature: float = 1.0) -> torch.Tensor:
-        del puzzle_ids
         if logits.ndim != 3 or logits.shape[-1] != self.config.vocab_size:
             raise ValueError(f"Expected logits shape (B, S, {self.config.vocab_size}), got {tuple(logits.shape)}")
         temp = float(temperature)
         if abs(temp) < 1e-6:
             temp = 1e-6
-        return self._distribution_embeddings(torch.softmax(logits.to(torch.float32) / temp, dim=-1))
+        return self._distribution_embeddings(torch.softmax(logits.to(torch.float32) / temp, dim=-1), puzzle_ids)
 
     def _probs_embeddings(self, probs: torch.Tensor, puzzle_ids: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
-        del puzzle_ids
         if probs.ndim != 3 or probs.shape[-1] != self.config.vocab_size:
             raise ValueError(f"Expected probs shape (B, S, {self.config.vocab_size}), got {tuple(probs.shape)}")
         probs = probs.to(torch.float32).clamp_min(0.0)
-        return self._distribution_embeddings(probs / probs.sum(dim=-1, keepdim=True).clamp_min(eps))
+        return self._distribution_embeddings(probs / probs.sum(dim=-1, keepdim=True).clamp_min(eps), puzzle_ids)
 
 
 class TRMModel(nn.Module):
+    inner_class = InnerNetwork
+
     def __init__(self, config_dict: dict) -> None:
         super().__init__()
+        config_dict = dict(config_dict)
+        puzzle_emb_ndim = int(config_dict.get("puzzle_emb_ndim", 0) or 0)
+        puzzle_emb_len = int(config_dict.get("puzzle_emb_len", 0) or 0)
+        if puzzle_emb_ndim > 0 and puzzle_emb_len <= 0:
+            puzzle_emb_len = -(puzzle_emb_ndim // -int(config_dict["hidden_size"]))
+            config_dict["puzzle_emb_len"] = puzzle_emb_len
+        if puzzle_emb_len > 0 and config_dict.get("input_seq_len") is None:
+            config_dict["input_seq_len"] = config_dict["seq_len"]
+            config_dict["seq_len"] = int(config_dict["seq_len"]) + puzzle_emb_len
         self.config = TRMConfig(**config_dict)
-        self.inner = InnerNetwork(self.config)
+        self.inner = self.inner_class(self.config)
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]) -> ModelCarry:
         b, device = batch["inputs"].shape[0], batch["inputs"].device

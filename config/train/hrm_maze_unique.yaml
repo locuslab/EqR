@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - trm_maze_unique
+  - _self_
+
+lr: 5e-4
+
+arch:
+  name: hrm@HRMModel
+  short_name: HRM
+  H_layers: 1
+  hidden_size: 24
+  num_heads: 3
+  puzzle_emb_ndim: 24

@@ -476,7 +476,7 @@ def train_batch(
             for sk, global_value in special_reduce_results.items():
                 processed_metrics[f"train/{sk}"] = global_value
 
-            processed_metrics["train/lr"] = lr_this_step
+            processed_metrics["train/lr"] = train_state.optimizers[0].param_groups[0]["lr"]
             processed_metrics["train/epoch"] = current_epoch
             if _should_log_steps_hist(config, train_state.step) and train_state.steps_hist_buffer:
                 processed_metrics["train/steps_hist"] = wandb.Histogram(train_state.steps_hist_buffer, num_bins=config.arch.halt_max_steps)
